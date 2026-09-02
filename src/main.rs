@@ -30,6 +30,7 @@ struct State {
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    camera_controller: CameraController,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     render_pipeline: wgpu::RenderPipeline,
@@ -42,13 +43,9 @@ struct State {
     vertices: Vec<Vertex>,
     indices: Vec<u16>,
 }
-// We need this for Rust to store our data correctly for the shaders
 #[repr(C)]
-// This is so we can store this in a buffer
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
-    // We can't use cgmath with bytemuck directly, so we'll have
-    // to convert the Matrix4 into a 4x4 f32 array
     view_proj: [[f32; 4]; 4],
 }
 
@@ -73,6 +70,70 @@ struct Camera {
     fovy: f32,
     znear: f32,
     zfar: f32,
+}
+struct CameraController {
+    speed: f32,
+    forward_pressed: bool,
+    backward_pressed: bool,
+    left_pressed: bool,
+    right_pressed: bool,
+}
+impl CameraController {
+    fn new(speed: f32) -> Self {
+        Self {
+            speed,
+            forward_pressed: false,
+            backward_pressed: false,
+            left_pressed: false,
+            right_pressed: false,
+        }
+    }
+    fn handle_key(&mut self, code: KeyCode, is_pressed: bool) -> bool {
+        match code {
+            KeyCode::KeyZ | KeyCode::ArrowUp => {
+                self.forward_pressed = is_pressed;
+                true
+            }
+            KeyCode::KeyQ | KeyCode::ArrowLeft => {
+                self.left_pressed = is_pressed;
+                true
+            }
+            KeyCode::KeyS | KeyCode::ArrowDown => {
+                self.backward_pressed = is_pressed;
+                true
+            }
+            KeyCode::KeyD | KeyCode::ArrowRight => {
+                self.right_pressed = is_pressed;
+                true
+            }
+            _ => false,
+        }
+    }
+    fn update_camera(&self, camera: &mut Camera) {
+        use cgmath::InnerSpace;
+        let forward = camera.target - camera.eye;
+        let forward_norm = forward.normalize();
+        let forward_mag = forward.magnitude();
+
+        if self.forward_pressed && forward_mag > self.speed {
+            camera.eye += forward_norm * self.speed;
+        }
+        if self.backward_pressed {
+            camera.eye -= forward_norm * self.speed;
+        }
+
+        let right = forward_norm.cross(camera.up);
+
+        let forward = camera.target - camera.eye;
+        let forward_mag = forward.magnitude();
+
+        if self.right_pressed {
+            camera.eye = camera.target - (forward + right * self.speed).normalize() * forward_mag;
+        }
+        if self.left_pressed {
+            camera.eye = camera.target - (forward - right * self.speed).normalize() * forward_mag;
+        }
+    }
 }
 
 impl Camera {
@@ -100,9 +161,8 @@ fn create_indices(n: u32) -> Vec<u16> {
         .flat_map(|x| [0u16, (x + 1) as u16, x as u16])
         .collect();
 
-    // aligne la taille en octets sur 4 (COPY_BUFFER_ALIGNMENT)
     if (indices.len() * std::mem::size_of::<u16>()) % 4 != 0 {
-        indices.push(0); // padding, ignoré par draw_indexed si num_indices reste correct
+        indices.push(0);
     }
 
     indices
@@ -110,9 +170,8 @@ fn create_indices(n: u32) -> Vec<u16> {
 
 impl State {
     async fn new(window: Arc<Window>, event_loop: &ActiveEventLoop) -> anyhow::Result<Self> {
-        const DEFAULT_N: u32 = 6; // valeur de départ, hexagone par exemple
-        const MAX_N: u32 = 78; // borne haute pour pré-allouer large (cf. message précédent)
-
+        const DEFAULT_N: u32 = 6;
+        const MAX_N: u32 = 78;
         let n = DEFAULT_N;
         let vertices: Vec<Vertex> = create_vertices(n, 1.0);
         let indices = create_indices(n);
@@ -231,19 +290,14 @@ impl State {
         let max_vertices_size = (MAX_N as usize * std::mem::size_of::<Vertex>()) as u64;
         let max_indices_size = ((MAX_N as usize - 2) * 3 * std::mem::size_of::<u16>()) as u64;
         let camera = Camera {
-            // position the camera 1 unit up and 2 units back
-            // +z is out of the screen
             eye: (5.0, 1.0, 3.0).into(),
-            // have it look at the origin
             target: (0.0, 0.0, 0.0).into(),
-            // which way is "up"
             up: cgmath::Vector3::unit_y(),
             aspect: config.width as f32 / config.height as f32,
             fovy: 45.0,
             znear: 0.1,
             zfar: 100.0,
         };
-        // in new() after creating `camera`
 
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update_view_proj(&camera);
@@ -262,7 +316,7 @@ impl State {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
-
+        let camera_controller = CameraController::new(0.5);
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Vertex Buffer"),
             size: max_vertices_size,
@@ -286,6 +340,7 @@ impl State {
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+            camera_controller,
             surface,
             device,
             queue,
@@ -315,6 +370,24 @@ impl State {
                 bytemuck::cast_slice(&[self.camera_uniform]),
             );
         }
+    }
+    fn handle_key(&mut self, event_loop: &ActiveEventLoop, key: KeyCode, pressed: bool) {
+        if key == KeyCode::Escape && pressed {
+            event_loop.exit();
+        } else {
+            self.camera_controller.handle_key(key, pressed);
+            self.update();
+        }
+    }
+
+    fn update(&mut self) {
+        self.camera_controller.update_camera(&mut self.camera);
+        self.camera_uniform.update_view_proj(&self.camera);
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
     }
 
     fn render(&mut self) -> anyhow::Result<()> {
